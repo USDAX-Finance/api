@@ -1,0 +1,252 @@
+import { Router, type IRouter } from "express";
+import { db, positionsTable, activityEventsTable } from "../db/index.js";
+import {
+  CreatePositionBody,
+  UpdatePositionBody,
+  GetPositionParams,
+  UpdatePositionParams,
+  ClosePositionParams,
+  ListPositionsResponse,
+  CreatePositionResponse,
+  GetPositionResponse,
+  UpdatePositionResponse,
+  ClosePositionResponse,
+} from "../schemas/index.js";
+import { eq, desc, sql } from "drizzle-orm";
+import { TOKEN_PRICES } from "../lib/prices.js";
+
+// Per-token liquidation thresholds (match seed.ts)
+const LIQ_THRESHOLDS: Record<string, number> = {
+  WETH:     0.80,
+  WBTC:     0.75,
+  stETH:    0.68,
+  "RWA-TB": 0.95,
+  "RWA-RE": 0.73,
+  "RWA-CB": 0.83,
+  TSLA:     0.67,
+  AMZN:     0.72,
+  PLTR:     0.63,
+  NFLX:     0.70,
+  AMD:      0.68,
+  NVDA:     0.72,
+  AAPL:     0.75,
+};
+
+function calcHealthFactor(collateralValueUsd: number, usdaxMinted: number, token?: string): number {
+  if (usdaxMinted === 0) return 999;
+  const thresh = LIQ_THRESHOLDS[token ?? ""] ?? 0.75;
+  return (collateralValueUsd * thresh) / usdaxMinted;
+}
+
+function calcCollateralRatio(collateralValueUsd: number, usdaxMinted: number): number {
+  if (usdaxMinted === 0) return 999;
+  return (collateralValueUsd / usdaxMinted) * 100;
+}
+
+function mapPosition(p: any) {
+  return {
+    id: p.id,
+    owner: p.owner,
+    collateralToken: p.collateralToken,
+    collateralAmount: Number(p.collateralAmount),
+    collateralValueUsd: Number(p.collateralValueUsd),
+    usdaxMinted: Number(p.usdaxMinted),
+    healthFactor: Number(p.healthFactor),
+    collateralRatio: Number(p.collateralRatio),
+    status: p.status,
+    createdAt: p.createdAt.toISOString(),
+    updatedAt: p.updatedAt.toISOString(),
+  };
+}
+
+const router: IRouter = Router();
+
+router.get("/positions", async (req, res): Promise<void> => {
+  const { owner, status } = req.query as { owner?: string; status?: string };
+
+  let positions;
+  if (owner && status) {
+    positions = await db
+      .select()
+      .from(positionsTable)
+      .where(sql`lower(${positionsTable.owner}) = lower(${owner}) AND ${positionsTable.status} = ${status}`)
+      .orderBy(desc(positionsTable.createdAt));
+  } else if (owner) {
+    positions = await db
+      .select()
+      .from(positionsTable)
+      .where(sql`lower(${positionsTable.owner}) = lower(${owner})`)
+      .orderBy(desc(positionsTable.createdAt));
+  } else if (status) {
+    positions = await db
+      .select()
+      .from(positionsTable)
+      .where(eq(positionsTable.status, status))
+      .orderBy(desc(positionsTable.createdAt));
+  } else {
+    positions = await db
+      .select()
+      .from(positionsTable)
+      .orderBy(desc(positionsTable.createdAt));
+  }
+
+  res.json(ListPositionsResponse.parse(positions.map(mapPosition)));
+});
+
+router.post("/positions", async (req, res): Promise<void> => {
+  const parsed = CreatePositionBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { owner, collateralToken, collateralAmount, usdaxToMint, depositTxHash, mintTxHash } = parsed.data;
+  const price = TOKEN_PRICES[collateralToken] ?? 0;
+  const collateralValueUsd = collateralAmount * price;
+  const healthFactor = calcHealthFactor(collateralValueUsd, usdaxToMint, collateralToken);
+  const collateralRatio = calcCollateralRatio(collateralValueUsd, usdaxToMint);
+
+  const [position] = await db
+    .insert(positionsTable)
+    .values({
+      owner: owner.toLowerCase(),
+      collateralToken,
+      collateralAmount: String(collateralAmount),
+      collateralValueUsd: String(collateralValueUsd),
+      usdaxMinted: String(usdaxToMint),
+      healthFactor: String(healthFactor),
+      collateralRatio: String(collateralRatio),
+      status: "active",
+    })
+    .returning();
+
+  // Only store real on-chain tx hashes — null when not provided (never fake)
+  await db.insert(activityEventsTable).values([
+    {
+      type: "DEPOSIT",
+      user: owner.toLowerCase(),
+      amount: String(collateralAmount),
+      token: collateralToken,
+      txHash: depositTxHash ?? null,
+    },
+    {
+      type: "MINT",
+      user: owner.toLowerCase(),
+      amount: String(usdaxToMint),
+      token: "USDAX",
+      txHash: mintTxHash ?? null,
+    },
+  ]);
+
+  res.status(201).json(CreatePositionResponse.parse(mapPosition(position)));
+});
+
+router.get("/positions/:id", async (req, res): Promise<void> => {
+  const raw = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = GetPositionParams.safeParse({ id: parseInt(raw, 10) });
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const [position] = await db.select().from(positionsTable).where(eq(positionsTable.id, params.data.id));
+  if (!position) {
+    res.status(404).json({ error: "Position not found" });
+    return;
+  }
+
+  res.json(GetPositionResponse.parse(mapPosition(position)));
+});
+
+router.patch("/positions/:id", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = UpdatePositionParams.safeParse({ id: parseInt(rawId, 10) });
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const parsed = UpdatePositionBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const [existing] = await db.select().from(positionsTable).where(eq(positionsTable.id, params.data.id));
+  if (!existing) {
+    res.status(404).json({ error: "Position not found" });
+    return;
+  }
+
+  const newCollateralAmount = parsed.data.collateralAmount ?? Number(existing.collateralAmount);
+  const newUsdaxMinted = parsed.data.usdaxMinted ?? Number(existing.usdaxMinted);
+  const price = TOKEN_PRICES[existing.collateralToken] ?? 0;
+  const collateralValueUsd = newCollateralAmount * price;
+  const healthFactor = calcHealthFactor(collateralValueUsd, newUsdaxMinted, existing.collateralToken);
+  const collateralRatio = calcCollateralRatio(collateralValueUsd, newUsdaxMinted);
+
+  if (healthFactor < 1.0) {
+    res.status(400).json({ error: "Health factor would be below 1.0." });
+    return;
+  }
+
+  const [updated] = await db
+    .update(positionsTable)
+    .set({
+      collateralAmount: String(newCollateralAmount),
+      collateralValueUsd: String(collateralValueUsd),
+      usdaxMinted: String(newUsdaxMinted),
+      healthFactor: String(healthFactor),
+      collateralRatio: String(collateralRatio),
+    })
+    .where(eq(positionsTable.id, params.data.id))
+    .returning();
+
+  res.json(UpdatePositionResponse.parse(mapPosition(updated)));
+});
+
+router.delete("/positions/:id", async (req, res): Promise<void> => {
+  const raw = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = ClosePositionParams.safeParse({ id: parseInt(raw, 10) });
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const [existing] = await db.select().from(positionsTable).where(eq(positionsTable.id, params.data.id));
+  if (!existing) {
+    res.status(404).json({ error: "Position not found" });
+    return;
+  }
+
+  // Accept real on-chain tx hashes from query params — null if not provided (never fake)
+  const burnTxHash   = typeof req.query.burnTxHash   === "string" ? req.query.burnTxHash   : null;
+  const redeemTxHash = typeof req.query.redeemTxHash === "string" ? req.query.redeemTxHash : null;
+
+  const [closed] = await db
+    .update(positionsTable)
+    .set({ status: "closed" })
+    .where(eq(positionsTable.id, params.data.id))
+    .returning();
+
+  await db.insert(activityEventsTable).values([
+    {
+      type: "BURN",
+      user: existing.owner,
+      amount: existing.usdaxMinted,
+      token: "USDAX",
+      txHash: burnTxHash,
+    },
+    {
+      type: "REDEEM",
+      user: existing.owner,
+      amount: existing.collateralAmount,
+      token: existing.collateralToken,
+      txHash: redeemTxHash,
+    },
+  ]);
+
+  res.json(ClosePositionResponse.parse(mapPosition(closed)));
+});
+
+export default router;
