@@ -1,4 +1,4 @@
-# USDAX Finance — API Server
+# USDAX Finance: API Server
 
 Backend REST API for the USDAX Finance protocol interface. Reads live data from deployed smart contracts on Robinhood Chain, stores vault and yield positions in PostgreSQL, and exposes a typed OpenAPI-compatible HTTP interface consumed by the frontend.
 
@@ -58,7 +58,7 @@ Backend REST API for the USDAX Finance protocol interface. Reads live data from 
 ### Staking
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/staking/stats` | Staking stats (projected — APX not yet deployed) |
+| GET | `/api/staking/stats` | Staking stats (projected, APX not yet deployed) |
 | GET | `/api/staking/positions` | Staking positions (filter: `?owner=`) |
 
 ---
@@ -99,7 +99,7 @@ Tracks USDAX deposits in USDAxSavings.
 
 ### Prerequisites
 - Node.js 20+
-- pnpm — `npm install -g pnpm`
+- pnpm: `npm install -g pnpm`
 - PostgreSQL 14+
 
 ### Install
@@ -156,8 +156,8 @@ See `.env.example` for a full list. Required variables:
 
 ## Related Repositories
 
-- [USDAX-Finance/contracts](https://github.com/USDAX-Finance/contracts) — Foundry smart contracts
-- [USDAX-Finance/interface](https://github.com/USDAX-Finance/interface) — React frontend
+- [USDAX-Finance/contracts](https://github.com/USDAX-Finance/contracts): Foundry smart contracts
+- [USDAX-Finance/interface](https://github.com/USDAX-Finance/interface): React frontend
 
 ---
 
